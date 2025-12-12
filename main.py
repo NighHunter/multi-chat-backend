@@ -22,6 +22,8 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal, engine, Base
 from models import User, Class, ClassMember, Message
+from sqlalchemy import text
+
 
 # ----------------------------------------------------
 # App + CORS
