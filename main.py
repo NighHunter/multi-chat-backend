@@ -38,18 +38,31 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
 # ----------------------------------------------------
 # DB setup
 # ----------------------------------------------------
-Base.metadata.create_all(bind=engine)
-
-
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
+
+
+@app.on_event("startup")
+def on_startup():
+    """
+    Ensure schema 'multichat' exists on startup, then create all tables.
+    This runs once when the app starts (locally and on Render).
+    """
+    # 1) Create schema if it does not exist
+    with engine.connect() as conn:
+        conn.execute(text("CREATE SCHEMA IF NOT EXISTS multichat"))
+        conn.commit()
+
+    # 2) Create tables in that schema
+    Base.metadata.create_all(bind=engine)
 
 
 # ----------------------------------------------------
