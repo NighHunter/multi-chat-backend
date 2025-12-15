@@ -13,7 +13,7 @@ from fastapi import (
     UploadFile,
     File,
     Form,
-    Query,  # <--- already there
+    Query,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -22,7 +22,6 @@ from sqlalchemy.orm import Session
 
 from database import SessionLocal, engine, Base
 from models import User, Class, ClassMember, Message
-from sqlalchemy import text
 
 
 # ----------------------------------------------------
@@ -42,27 +41,54 @@ app.add_middleware(
 # ----------------------------------------------------
 # DB setup
 # ----------------------------------------------------
+Base.metadata.create_all(bind=engine)
+
+
+def seed_default_admin() -> None:
+    """
+    Create default admin account if not present.
+
+    Default admin:
+      email    = admin123@admin.com
+      password = Admin123
+    """
+    db = SessionLocal()
+    try:
+        default_email = "admin123@admin.com"
+        default_password = "Admin123"
+
+        existing = (
+            db.query(User)
+            .filter(User.email == default_email, User.role == "admin")
+            .first()
+        )
+        if existing:
+            return
+
+        admin = User(
+            full_name="System Admin",
+            email=default_email,
+            password=default_password,
+            role="admin",
+            student_id=None,
+            staff_id=None,
+        )
+        db.add(admin)
+        db.commit()
+    finally:
+        db.close()
+
+
+# Run once at startup
+seed_default_admin()
+
+
 def get_db() -> Generator[Session, None, None]:
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
-
-
-@app.on_event("startup")
-def on_startup():
-    """
-    Ensure schema 'multichat' exists on startup, then create all tables.
-    This runs once when the app starts (locally and on Render).
-    """
-    # 1) Create schema if it does not exist
-    with engine.connect() as conn:
-        conn.execute(text("CREATE SCHEMA IF NOT EXISTS multichat"))
-        conn.commit()
-
-    # 2) Create tables in that schema
-    Base.metadata.create_all(bind=engine)
 
 
 # ----------------------------------------------------
@@ -72,7 +98,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# NEW: separate folder for avatar images
+# separate folder for avatar images
 AVATAR_DIR = os.path.join(UPLOAD_DIR, "avatars")
 os.makedirs(AVATAR_DIR, exist_ok=True)
 
