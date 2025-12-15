@@ -14,6 +14,8 @@ from fastapi import (
     File,
     Form,
     Query,
+    WebSocket,             
+    WebSocketDisconnect,  
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -89,6 +91,54 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
+
+# ====================================================
+# Simple WebSocket connection manager
+# ====================================================
+from typing import Dict, Tuple
+
+RoomKey = Tuple[int, str]  # (class_id, channel)
+
+
+class ConnectionManager:
+    def __init__(self) -> None:
+        # room key -> list of websockets
+        self.active: Dict[RoomKey, list[WebSocket]] = {}
+
+    async def connect(self, class_id: int, channel: str, websocket: WebSocket):
+        room: RoomKey = (class_id, channel)
+        await websocket.accept()
+        self.active.setdefault(room, []).append(websocket)
+
+    def disconnect(self, class_id: int, channel: str, websocket: WebSocket):
+        room: RoomKey = (class_id, channel)
+        conns = self.active.get(room, [])
+        if websocket in conns:
+            conns.remove(websocket)
+        if not conns and room in self.active:
+            del self.active[room]
+
+    async def broadcast(self, class_id: int, channel: str, message: dict):
+        """
+        Send a JSON message to everyone in the same room.
+        """
+        room: RoomKey = (class_id, channel)
+        conns = self.active.get(room, [])
+        dead: list[WebSocket] = []
+
+        for ws in conns:
+            try:
+                await ws.send_json(message)
+            except Exception:
+                dead.append(ws)
+
+        # clean closed connections
+        for ws in dead:
+            self.disconnect(class_id, channel, ws)
+
+
+manager = ConnectionManager()
+
 
 
 # ----------------------------------------------------
@@ -945,6 +995,98 @@ def post_class_message(
     db.commit()
     db.refresh(msg)
     return message_to_out(msg)
+
+# ====================================================
+# WebSocket endpoint for real-time chat
+# ====================================================
+@app.websocket("/ws/classes/{class_id}/{channel}")
+async def websocket_chat(
+    websocket: WebSocket,
+    class_id: int,
+    channel: str,
+):
+    """
+    Real-time chat for a given class + channel.
+
+    Client sends JSON:
+    {
+      "sender_email": "...",
+      "sender_name": "...",
+      "content": "...",
+      "attachments": [ { filename,url,content_type }, ... ]  (optional)
+    }
+
+    Server will:
+      1) save to DB
+      2) broadcast the saved message (MessageOut) to everyone in the room
+    """
+    await manager.connect(class_id, channel, websocket)
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+
+            sender_email = (data.get("sender_email") or "").strip().lower()
+            sender_name = data.get("sender_name") or ""
+            content = data.get("content") or ""
+            attachments = data.get("attachments") or []
+
+            if not sender_email or not content:
+                # Ignore empty messages
+                continue
+
+            # Open DB session per message
+            db = SessionLocal()
+            try:
+                # Make sure class exists
+                cls = db.query(Class).filter(Class.id == class_id).first()
+                if not cls:
+                    # Tell this client then close
+                    await websocket.send_json(
+                        {"error": "Class not found", "code": "CLASS_NOT_FOUND"}
+                    )
+                    await websocket.close()
+                    break
+
+                # Serialize attachments to JSON string
+                try:
+                    attachments_json = json.dumps(attachments)
+                except Exception:
+                    attachments_json = "[]"
+
+                # Save message
+                msg = Message(
+                    class_id=class_id,
+                    channel=channel,
+                    sender_email=sender_email,
+                    sender_name=sender_name,
+                    content=content,
+                    attachments_json=attachments_json,
+                )
+                db.add(msg)
+                db.commit()
+                db.refresh(msg)
+
+                # Convert to MessageOut dict
+                out_schema = message_to_out(msg)
+                out_dict = out_schema.model_dump()
+
+            finally:
+                db.close()
+
+            # Broadcast to everyone in the room
+            await manager.broadcast(class_id, channel, out_dict)
+
+    except WebSocketDisconnect:
+        manager.disconnect(class_id, channel, websocket)
+    except Exception as e:
+        # Optional: debug log
+        print("WebSocket error:", e)
+        manager.disconnect(class_id, channel, websocket)
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 @app.delete("/classes/{class_id}/messages/{message_id}")
