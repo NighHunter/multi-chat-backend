@@ -6,6 +6,11 @@ import json
 import os
 from uuid import uuid4
 
+# ✅ NEW imports for WebSocket real-time
+import asyncio
+from collections import defaultdict
+from fastapi import WebSocket, WebSocketDisconnect
+
 from fastapi import (
     FastAPI,
     HTTPException,
@@ -36,6 +41,52 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ----------------------------------------------------
+# ✅ WebSocket manager (real-time chat rooms)
+# ----------------------------------------------------
+class WSManager:
+    """
+    Keep a list of connected sockets per (class_id, channel).
+    We store by user_key (email or generated id) so we can exclude sender.
+    """
+    def __init__(self):
+        # rooms[(class_id, channel)] = { user_key: websocket }
+        self.rooms = defaultdict(dict)
+        self.lock = asyncio.Lock()
+
+    async def connect(self, websocket: WebSocket, class_id: int, channel: str, user_key: str):
+        await websocket.accept()
+        async with self.lock:
+            self.rooms[(class_id, channel)][user_key] = websocket
+
+    async def disconnect(self, class_id: int, channel: str, user_key: str):
+        async with self.lock:
+            self.rooms[(class_id, channel)].pop(user_key, None)
+
+    async def broadcast(self, class_id: int, channel: str, payload: dict, exclude_user_key: Optional[str] = None):
+        key = (class_id, channel)
+
+        async with self.lock:
+            items = list(self.rooms.get(key, {}).items())
+
+        dead_keys = []
+        for user_key, ws in items:
+            if exclude_user_key and user_key == exclude_user_key:
+                continue
+            try:
+                await ws.send_json(payload)
+            except Exception:
+                dead_keys.append(user_key)
+
+        if dead_keys:
+            async with self.lock:
+                for k in dead_keys:
+                    self.rooms[key].pop(k, None)
+
+
+ws_manager = WSManager()
 
 
 # ----------------------------------------------------
@@ -290,6 +341,38 @@ class DeleteMessageRequest(BaseModel):
 @app.get("/health")
 def health_check():
     return {"status": "ok", "message": "Class Multi-Chat backend is running"}
+
+
+# ====================================================
+# ✅ WebSocket endpoint for real-time messages
+# Connect like:
+#   wss://YOUR-BACKEND/ws/12/general?email=student@gmail.com
+# ====================================================
+@app.websocket("/ws/{class_id}/{channel}")
+async def ws_chat(websocket: WebSocket, class_id: int, channel: str, email: Optional[str] = Query(None)):
+    # In your project, token is "demo-token", so we use email as identity
+    user_key = (email or "").strip().lower() or f"anon-{uuid4().hex}"
+
+    # Optional: verify class exists (prevents random rooms)
+    db = SessionLocal()
+    try:
+        cls = db.query(Class).filter(Class.id == class_id).first()
+        if not cls:
+            await websocket.close(code=1008)
+            return
+    finally:
+        db.close()
+
+    await ws_manager.connect(websocket, class_id, channel, user_key)
+
+    try:
+        while True:
+            # keep connection alive; client can send "ping"
+            _ = await websocket.receive_text()
+    except WebSocketDisconnect:
+        pass
+    finally:
+        await ws_manager.disconnect(class_id, channel, user_key)
 
 
 # ====================================================
@@ -921,7 +1004,7 @@ def get_class_messages(
     "/classes/{class_id}/messages",
     response_model=MessageOut,
 )
-def post_class_message(
+async def post_class_message(  # ✅ changed to async
     class_id: int,
     data: MessageCreate,
     db: Session = Depends(get_db),
@@ -944,7 +1027,19 @@ def post_class_message(
     db.add(msg)
     db.commit()
     db.refresh(msg)
-    return message_to_out(msg)
+
+    out = message_to_out(msg)
+
+    # ✅ Broadcast to all users in this (class_id + channel)
+    payload = {
+        "type": "new_message",
+        "class_id": class_id,
+        "channel": data.channel,
+        "message": out.dict(),
+    }
+    await ws_manager.broadcast(class_id, data.channel, payload, exclude_user_key=data.sender_email.strip().lower())
+
+    return out
 
 
 @app.delete("/classes/{class_id}/messages/{message_id}")
